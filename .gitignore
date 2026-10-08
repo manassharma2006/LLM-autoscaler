@@ -1,0 +1,12 @@
+# Python virtual environment
+fastapi-service/.venv/
+
+# Environment variables / secrets
+fastapi-service/.env
+
+# Python cache
+fastapi-service/**/__pycache__/
+fastapi-service/**/*.pyc
+
+# macOS
+.DS_Store
