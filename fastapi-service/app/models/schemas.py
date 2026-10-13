@@ -1,3 +1,4 @@
+from typing import Optional
 from pydantic import BaseModel, Field
 
 
@@ -15,3 +16,13 @@ class GenerateResponse(BaseModel):
 class QueueStatusResponse(BaseModel):
     queue_name: str
     queue_depth: int
+
+
+class ResultResponse(BaseModel):
+    request_id: str
+    status: str
+    output: Optional[str] = None
+    error: Optional[str] = None
+    queue_wait_seconds: Optional[float] = None
+    inference_seconds: Optional[float] = None
+    total_seconds: Optional[float] = None

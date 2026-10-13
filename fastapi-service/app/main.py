@@ -1,26 +1,25 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-
+from app.routes.autoscaler import router as autoscaler_router
 from app.routes.inference import router
 from app.services.redis_service import redis_service
+
+from app.routes.workers import router as workers_router
+from app.services.worker_registry import worker_registry
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
-    # Startup
     try:
         await redis_service.ping()
         print("Connected to Redis")
+
     except Exception as e:
-        print(f"Redis connection failed: {e}")
+        print(f"Startup initialization failed: {e}")
 
     yield
-
-    # Shutdown
     await redis_service.close()
-
 
 app = FastAPI(
     title="AI Inference Gateway",
@@ -31,7 +30,8 @@ app = FastAPI(
 
 
 app.include_router(router)
-
+app.include_router(workers_router)
+app.include_router(autoscaler_router)
 
 @app.get("/health")
 async def health():
