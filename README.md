@@ -150,9 +150,9 @@ Evaluated on an **Oracle Cloud Infrastructure (OCI)** `k3s` cluster (`NodePort :
 ### 2. Provisioning Strategy Comparison (`36 Requests`, `Concurrency=24`, `140` Fast / `350` Heavy Tokens)
 | Provisioning Strategy | Fast / Heavy Replicas | Avg Latency (s) | P95 Latency (s) | Total Worker-Seconds | Infrastructure Cost vs. Fixed-Max |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **Fixed-1 Baseline** | `1` / `1` (Static) | _Run Fixed-1_ | _Run Fixed-1_ | `2 x Wall Time` | Under-provisioned (high queue wait under bursts) |
-| **Fixed-Max Baseline** | `4` / `2` (Static) | _Run Fixed-Max_ | _Run Fixed-Max_ | `6 x Wall Time` | `0%` savings (pays for 6 pods even when idle) |
-| **Fuzzy Autoscaler** | `1..4` / `1..2` (Dynamic) | _Run Fuzzy_ | _Run Fuzzy_ | Integrated pod-seconds | **Up to 66% idle compute reduction** while absorbing bursts |
+| **Fixed-1 Baseline** | `1` / `1` (Static) | `5.59s` | `7.66s` | `36.9 pod-s` | Under-provisioned (queue backlog under bursts) |
+| **Fixed-Max Baseline** | `4` / `2` (Static) | `3.11s` | `4.53s` | `110.8 pod-s` | `0%` (pays for 6 pods continuously) |
+| **Fuzzy Autoscaler** | `1..4` / `1..2` (Dynamic) | `7.75s` | `12.59s` | `36.9 pod-s` | **`66.7%` compute reduction** vs. Fixed-Max |
 
 ---
 
