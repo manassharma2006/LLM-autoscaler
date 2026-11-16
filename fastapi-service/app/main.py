@@ -6,7 +6,6 @@ from app.routes.inference import router
 from app.services.redis_service import redis_service
 
 from app.routes.workers import router as workers_router
-from app.services.worker_registry import worker_registry
 
 
 @asynccontextmanager

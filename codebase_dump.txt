@@ -1,0 +1,1572 @@
+==> ./README.md <==
+# LLM-autoscaler
+joint project for heterogenous LLM autoscaler
+
+==> ./fastapi-service/test_redis.py <==
+
+import asyncio
+import redis.asyncio as redis
+
+
+async def main():
+    client = redis.Redis(
+        host="localhost",
+        port=6379,
+        db=0,
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=3,
+    )
+
+    try:
+        for i in range(5):
+            print(f"Test {i + 1}: {await client.ping()}")
+            await asyncio.sleep(1)
+    except Exception as exc:
+        print(type(exc).__name__, repr(exc))
+    finally:
+        await client.aclose()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
+==> ./fastapi-service/benchmark_autoscaler.py <==
+import asyncio
+import statistics
+import time
+
+import httpx
+
+BASE_URL = "http://127.0.0.1:8000"
+TOTAL_REQUESTS = 50
+CONCURRENCY = 50
+COMPLETION_TIMEOUT_SECONDS = 180
+POLL_INTERVAL_SECONDS = 0.5
+HTTP_TIMEOUT_SECONDS = 10
+
+
+async def submit_request(client, number, semaphore):
+    async with semaphore:
+        started = time.perf_counter()
+        try:
+            response = await client.post(
+                f"{BASE_URL}/generate",
+                json={"prompt": f"Benchmark request {number}: Explain autoscaling."},
+                timeout=HTTP_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            body = response.json()
+            request_id = body.get("request_id")
+            if not request_id:
+                raise ValueError("API response did not include request_id")
+            return {
+                "number": number,
+                "request_id": request_id,
+                "started": started,
+                "accepted": True,
+                "error": None,
+            }
+        except Exception as exc:
+            return {
+                "number": number,
+                "request_id": None,
+                "started": started,
+                "accepted": False,
+                "error": str(exc),
+            }
+
+
+def optional_float(value):
+    try:
+        return None if value is None or value == "" else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def wait_for_result(client, item):
+    deadline = time.perf_counter() + COMPLETION_TIMEOUT_SECONDS
+    last_error = None
+
+    while time.perf_counter() < deadline:
+        try:
+            response = await client.get(
+                f"{BASE_URL}/result/{item['request_id']}",
+                timeout=HTTP_TIMEOUT_SECONDS,
+            )
+            if response.status_code == 404:
+                last_error = "result not found yet"
+            else:
+                response.raise_for_status()
+                body = response.json()
+                status = str(body.get("status", "")).lower()
+
+                if status in {"completed", "failed", "error"}:
+                    finished = time.perf_counter()
+                    return {
+                        **item,
+                        "status": "completed" if status == "completed" else "failed",
+                        "end_to_end": finished - item["started"],
+                        "queue_wait": optional_float(body.get("queue_wait_seconds")),
+                        "inference": optional_float(body.get("inference_seconds")),
+                        "error": body.get("error") or body.get("detail"),
+                    }
+                last_error = None
+        except Exception as exc:
+            last_error = str(exc)
+
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+    return {
+        **item,
+        "status": "timed_out",
+        "end_to_end": time.perf_counter() - item["started"],
+        "queue_wait": None,
+        "inference": None,
+        "error": last_error or "completion deadline exceeded",
+    }
+
+
+def report_distribution(label, values):
+    if not values:
+        print(f"{label}: n/a")
+        return
+    ordered = sorted(values)
+    p95_index = max(0, min(len(ordered) - 1, int(0.95 * len(ordered)) - 1))
+    print(
+        f"{label}: mean={statistics.mean(ordered):.2f}s, "
+        f"median={statistics.median(ordered):.2f}s, "
+        f"p95={ordered[p95_index]:.2f}s"
+    )
+
+
+async def main():
+    print("=" * 60)
+    print("AUTOSCALER BENCHMARK — SIMULATED INFERENCE")
+    print(f"Requests: {TOTAL_REQUESTS} | concurrency: {CONCURRENCY}")
+    print("=" * 60)
+    print("Keep run_autoscaler.py running in another terminal.")
+
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    limits = httpx.Limits(
+        max_connections=CONCURRENCY,
+        max_keepalive_connections=CONCURRENCY,
+    )
+    started = time.perf_counter()
+
+    async with httpx.AsyncClient(
+        limits=limits, timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS)
+    ) as client:
+        try:
+            response = await client.get(f"{BASE_URL}/docs")
+            response.raise_for_status()
+        except Exception as exc:
+            print(f"API is unreachable at {BASE_URL}: {exc}")
+            return
+
+        submissions = await asyncio.gather(*[
+            submit_request(client, i, semaphore)
+            for i in range(1, TOTAL_REQUESTS + 1)
+        ])
+        accepted = [item for item in submissions if item["accepted"]]
+        rejected = [item for item in submissions if not item["accepted"]]
+
+        print(
+            f"Accepted: {len(accepted)}/{TOTAL_REQUESTS}; "
+            f"submission failures: {len(rejected)}"
+        )
+        for item in rejected[:5]:
+            print(f"Submission {item['number']} failed: {item['error']}")
+
+        results = await asyncio.gather(*[
+            wait_for_result(client, item) for item in accepted
+        ])
+
+    elapsed = time.perf_counter() - started
+    completed = [r for r in results if r["status"] == "completed"]
+    failed = [r for r in results if r["status"] == "failed"]
+    timed_out = [r for r in results if r["status"] == "timed_out"]
+
+    print("\n" + "=" * 60)
+    print("RESULTS")
+    print("=" * 60)
+    print(f"Submitted:             {len(submissions)}")
+    print(f"Accepted:              {len(accepted)}")
+    print(f"Completed:             {len(completed)}")
+    print(f"Failed (including submit failures): {len(failed) + len(rejected)}")
+    print(f"Timed out:              {len(timed_out)}")
+    print(f"Total elapsed:          {elapsed:.2f}s")
+    print(f"Completion throughput:  {len(completed) / elapsed:.2f} requests/s")
+
+    report_distribution(
+        "End-to-end latency",
+        [r["end_to_end"] for r in completed],
+    )
+    report_distribution(
+        "Queue wait (worker-reported)",
+        [r["queue_wait"] for r in completed if r["queue_wait"] is not None],
+    )
+    report_distribution(
+        "Inference duration (worker-reported)",
+        [r["inference"] for r in completed if r["inference"] is not None],
+    )
+
+    if failed:
+        print("\nFailed request examples:")
+        for item in failed[:5]:
+            print(f"  {item['request_id']}: {item.get('error')}")
+    if timed_out:
+        print("\nTimed-out request examples:")
+        for item in timed_out[:5]:
+            print(f"  {item['request_id']}: {item.get('error')}")
+
+    print("\nWait for queue depth and active requests to reach 0.")
+    print("Then confirm the controller scales back down to 1 worker.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+==> ./fastapi-service/app/config.py <==
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
+    REDIS_QUEUE: str = "inference_queue"
+
+    class Config:
+        env_file = ".env"
+
+
+settings = Settings()
+
+==> ./fastapi-service/app/models/schemas.py <==
+from typing import Optional
+from pydantic import BaseModel, Field
+
+
+class GenerateRequest(BaseModel):
+    prompt: str = Field(..., min_length=1)
+    max_tokens: int = Field(default=100, ge=1, le=4096)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+
+
+class GenerateResponse(BaseModel):
+    request_id: str
+    status: str
+
+
+class QueueStatusResponse(BaseModel):
+    queue_name: str
+    queue_depth: int
+
+
+class ResultResponse(BaseModel):
+    request_id: str
+    status: str
+    output: Optional[str] = None
+    error: Optional[str] = None
+    queue_wait_seconds: Optional[float] = None
+    inference_seconds: Optional[float] = None
+    total_seconds: Optional[float] = None
+
+==> ./fastapi-service/app/worker/worker.py <==
+import asyncio
+import json
+import os
+import signal
+import socket
+import time
+from datetime import datetime
+
+import redis.asyncio as redis
+
+from app.config import settings
+from app.services.worker_registry import worker_registry
+
+
+class InferenceWorker:
+    def __init__(self):
+        self.worker_id = os.getenv("WORKER_ID") or f"worker-{socket.gethostname()}"
+        self.completed_requests = 0
+        self.total_inference_seconds = 0.0
+        self.last_inference_seconds = 0.0
+        self.redis = redis.Redis(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            db=settings.REDIS_DB,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=10,
+            health_check_interval=30,
+        )
+        self.queue_name = settings.REDIS_QUEUE
+        self.processing_queue = worker_registry.processing_queue(self.worker_id)
+        self.stop_requested = asyncio.Event()
+
+    async def send_heartbeat(self):
+        await worker_registry.heartbeat(
+            worker_id=self.worker_id,
+            completed_requests=self.completed_requests,
+            total_inference_seconds=self.total_inference_seconds,
+            last_inference_seconds=self.last_inference_seconds,
+        )
+
+    async def heartbeat_loop(self):
+        while not self.stop_requested.is_set():
+            try:
+                await self.send_heartbeat()
+            except Exception as exc:
+                print(f"[{self.worker_id}] heartbeat error: {exc}", flush=True)
+            try:
+                await asyncio.wait_for(self.stop_requested.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+
+    async def generate(self, prompt: str, max_tokens: int) -> str:
+        """Temporary simulated inference backend for the demo."""
+        await asyncio.sleep(2)
+        return (
+            f"[SIMULATED OUTPUT] Processed prompt: {prompt[:200]} "
+            f"(max_tokens={max_tokens})"
+        )
+
+    @staticmethod
+    def created_timestamp(value: str) -> float:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+    async def requeue_claim(self, raw_request: str, request_id: str | None = None):
+        """Put an unfinished claim back before this worker exits."""
+        await self.redis.lrem(self.processing_queue, 1, raw_request)
+        await self.redis.lpush(self.queue_name, raw_request)
+        if request_id:
+            await self.redis.hset(
+                f"request:{request_id}",
+                mapping={"status": "queued", "requeued_at": time.time()},
+            )
+
+    async def process_claim(self, raw_request: str):
+        request = json.loads(raw_request)
+        request_id = request["request_id"]
+        request_key = f"request:{request_id}"
+        terminal = False
+        started = False
+
+        try:
+            started_at = time.time()
+            queue_wait = max(0.0, started_at - self.created_timestamp(request["created_at"]))
+            await worker_registry.start_request(self.worker_id)
+            started = True
+            await self.redis.hset(
+                request_key,
+                mapping={
+                    "status": "processing",
+                    "worker_id": self.worker_id,
+                    "started_at": started_at,
+                    "queue_wait_seconds": queue_wait,
+                },
+            )
+            print(f"[{self.worker_id}] processing request={request_id}", flush=True)
+
+            inference_started = time.time()
+            output = await self.generate(request["prompt"], int(request["max_tokens"]))
+            finished_at = time.time()
+            duration = finished_at - inference_started
+            self.completed_requests += 1
+            self.total_inference_seconds += duration
+            self.last_inference_seconds = duration
+            await self.redis.hset(
+                request_key,
+                mapping={
+                    "status": "completed",
+                    "output": output,
+                    "finished_at": finished_at,
+                    "inference_seconds": duration,
+                    "total_seconds": max(0.0, finished_at - self.created_timestamp(request["created_at"])),
+                },
+            )
+            terminal = True
+            print(f"[{self.worker_id}] completed request={request_id}", flush=True)
+        except asyncio.CancelledError:
+            await self.requeue_claim(raw_request, request_id)
+            raise
+        except Exception as exc:
+            finished_at = time.time()
+            await self.redis.hset(
+                request_key,
+                mapping={
+                    "status": "failed",
+                    "error": str(exc)[:1000],
+                    "finished_at": finished_at,
+                    "total_seconds": max(0.0, finished_at - self.created_timestamp(request["created_at"])),
+                },
+            )
+            terminal = True
+            print(f"[{self.worker_id}] failed request={request_id}: {exc}", flush=True)
+        finally:
+            if started:
+                await worker_registry.finish_request(self.worker_id)
+            if terminal:
+                await self.redis.lrem(self.processing_queue, 1, raw_request)
+
+    async def run(self):
+        print(f"[{self.worker_id}] listening on shared queue {self.queue_name}", flush=True)
+        await worker_registry.register(self.worker_id)
+        heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+
+        try:
+            while not self.stop_requested.is_set():
+                raw_request = await self.redis.brpoplpush(
+                    self.queue_name, self.processing_queue, timeout=1
+                )
+                if raw_request is None:
+                    continue
+                await self.process_claim(raw_request)
+        finally:
+            self.stop_requested.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await worker_registry.deregister(self.worker_id)
+            except Exception as exc:
+                print(f"[{self.worker_id}] deregistration deferred: {exc}", flush=True)
+
+    async def close(self):
+        await self.redis.aclose()
+
+
+async def main():
+    worker = InferenceWorker()
+    loop = asyncio.get_running_loop()
+
+    def request_stop():
+        print(f"[{worker.worker_id}] stop requested; draining current request", flush=True)
+        worker.stop_requested.set()
+
+    for signal_name in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(signal_name, request_stop)
+    try:
+        await worker.run()
+    finally:
+        await worker.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+==> ./fastapi-service/app/main.py <==
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from app.routes.autoscaler import router as autoscaler_router
+from app.routes.inference import router
+from app.services.redis_service import redis_service
+
+from app.routes.workers import router as workers_router
+from app.services.worker_registry import worker_registry
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        await redis_service.ping()
+        print("Connected to Redis")
+
+    except Exception as e:
+        print(f"Startup initialization failed: {e}")
+
+    yield
+    await redis_service.close()
+
+app = FastAPI(
+    title="AI Inference Gateway",
+    description="FastAPI gateway for the auto-scaling inference platform",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+
+app.include_router(router)
+app.include_router(workers_router)
+app.include_router(autoscaler_router)
+
+@app.get("/health")
+async def health():
+    try:
+        await redis_service.ping()
+
+        return {
+            "status": "healthy",
+            "redis": "connected",
+        }
+
+    except Exception:
+        return {
+            "status": "unhealthy",
+            "redis": "disconnected",
+        }
+
+==> ./fastapi-service/app/routes/autoscaler.py <==
+
+from fastapi import APIRouter, HTTPException
+
+from app.services.autoscaler import autoscaler_service
+
+router = APIRouter(prefix="/autoscaler", tags=["Autoscaler"])
+
+
+@router.get("/status")
+async def get_autoscaler_status():
+    return autoscaler_service.status()
+
+
+@router.post("/evaluate")
+async def evaluate_autoscaler():
+    try:
+        return await autoscaler_service.evaluate()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Autoscaler evaluation failed: {exc}",
+        )
+
+==> ./fastapi-service/app/routes/inference.py <==
+import uuid
+from datetime import datetime, timezone
+from fastapi import APIRouter, HTTPException
+
+from app.models.schemas import (
+    GenerateRequest,
+    GenerateResponse,
+    QueueStatusResponse,
+    ResultResponse,
+)
+from app.services.redis_service import redis_service
+from app.config import settings
+router = APIRouter()
+
+
+
+
+@router.post("/generate", response_model=GenerateResponse)
+async def generate(request: GenerateRequest):
+    request_id = str(uuid.uuid4())
+
+
+    request_data = {
+        "request_id": request_id,
+        "prompt": request.prompt,
+        "max_tokens": request.max_tokens,
+        "temperature": request.temperature,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # This call stores the request and enqueues it once on the shared queue.
+    await redis_service.enqueue_request(request_data)
+
+
+    return GenerateResponse(
+        request_id=request_id,
+        status="queued",
+    )
+
+
+@router.get("/result/{request_id}", response_model=ResultResponse)
+async def get_result(request_id: str):
+    try:
+        data = await redis_service.get_request(request_id)
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to read request status. Check Redis.",
+        )
+
+    if not data:
+        raise HTTPException(
+            status_code=404,
+            detail="Request not found.",
+        )
+
+    def parse_float(value):
+        return float(value) if value is not None else None
+
+    return ResultResponse(
+        request_id=request_id,
+        status=data["status"],
+        output=data.get("output"),
+        error=data.get("error"),
+        queue_wait_seconds=parse_float(
+            data.get("queue_wait_seconds")
+        ),
+        inference_seconds=parse_float(
+            data.get("inference_seconds")
+        ),
+        total_seconds=parse_float(data.get("total_seconds")),
+    )
+
+
+@router.get("/queue/status", response_model=QueueStatusResponse)
+async def queue_status():
+    try:
+        depth = await redis_service.get_queue_depth()
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to read queue. Check Redis.",
+        )
+
+    return QueueStatusResponse(
+        queue_name=settings.REDIS_QUEUE,
+        queue_depth=depth,
+    )
+
+==> ./fastapi-service/app/routes/workers.py <==
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from app.services.worker_registry import worker_registry
+
+router = APIRouter(prefix="/workers", tags=["Workers"])
+
+
+class HeartbeatRequest(BaseModel):
+    active_requests: int = Field(default=0, ge=0)
+    completed_requests: int = Field(default=0, ge=0)
+    total_inference_seconds: float = Field(default=0.0, ge=0)
+    last_inference_seconds: float = Field(default=0.0, ge=0)
+
+
+@router.get("")
+async def list_workers():
+    return {"workers": await worker_registry.list_workers()}
+
+
+@router.get("/{worker_id}")
+async def get_worker(worker_id: str):
+    worker = await worker_registry.get_worker(worker_id)
+
+    if worker is None:
+        raise HTTPException(status_code=404, detail="Worker not found")
+
+    return worker
+
+
+@router.post("/{worker_id}/heartbeat")
+async def worker_heartbeat(
+    worker_id: str,
+    heartbeat: HeartbeatRequest,
+):
+    try:
+        await worker_registry.heartbeat(
+            worker_id=worker_id,
+            completed_requests=heartbeat.completed_requests,
+            total_inference_seconds=heartbeat.total_inference_seconds,
+            last_inference_seconds=heartbeat.last_inference_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    return {"worker_id": worker_id, "accepted": True}
+
+==> ./fastapi-service/app/services/fuzzy_scaler.py <==
+
+from dataclasses import dataclass
+
+
+def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def triangle(value: float, left: float, peak: float, right: float) -> float:
+    """Triangular fuzzy membership, returning a value between 0 and 1."""
+    if value < left or value > right:
+        return 0.0
+
+    if value == peak:
+        return 1.0
+
+    if value < peak:
+        return (value - left) / (peak - left) if peak != left else 1.0
+
+    return (right - value) / (right - peak) if right != peak else 1.0
+
+
+def low_membership(value: float, full_until: float, zero_at: float) -> float:
+    if value <= full_until:
+        return 1.0
+    if value >= zero_at:
+        return 0.0
+    return (zero_at - value) / (zero_at - full_until)
+
+
+def high_membership(value: float, zero_until: float, full_at: float) -> float:
+    if value <= zero_until:
+        return 0.0
+    if value >= full_at:
+        return 1.0
+    return (value - zero_until) / (full_at - zero_until)
+
+
+@dataclass
+class ScalingDecision:
+    score: float
+    action: str
+    queue_pressure: float
+    growth_pressure: float
+    latency_pressure: float
+
+
+class FuzzyScaler:
+    """
+    Rule-based fuzzy controller.
+
+    Inputs:
+      queue_depth: number of requests waiting in Redis
+      queue_growth_per_minute: change in queue depth per minute
+      latency_seconds: observed average inference latency
+
+    Output:
+      score between 0 and 1, interpreted as scaling urgency.
+    """
+
+    def evaluate(
+        self,
+        queue_depth: int,
+        queue_growth_per_minute: float,
+        latency_seconds: float,
+    ) -> ScalingDecision:
+        # Normalize raw measurements into fuzzy memberships.
+        q_low = low_membership(max(queue_depth, 0), 1, 10)
+        q_medium = triangle(max(queue_depth, 0), 2, 10, 20)
+        q_high = high_membership(max(queue_depth, 0), 10, 25)
+
+        growth = queue_growth_per_minute
+        g_low = low_membership(growth, -5, 0)
+        g_medium = triangle(growth, -2, 5, 15)
+        g_high = high_membership(growth, 5, 20)
+
+        latency = max(latency_seconds, 0.0)
+        l_low = low_membership(latency, 1.0, 2.0)
+        l_medium = triangle(latency, 1.0, 3.0, 5.0)
+        l_high = high_membership(latency, 3.0, 6.0)
+
+        # Fuzzy rules. Each rule has a strength and an output score.
+        # 0.0 = no urgency; 1.0 = maximum scaling urgency.
+        
+        rules = [
+            # Severe backlog and high latency.
+            (min(q_high, l_high), 0.95),
+
+            # Severe backlog that is still growing.
+            (min(q_high, g_high), 0.95),
+
+            # A large backlog alone must create scaling pressure.
+            (q_high, 0.85),
+
+            # Medium backlog, rising queue, and elevated latency.
+            (min(q_medium, g_high, l_medium), 0.80),
+
+            # High latency even before the queue becomes large.
+            (l_high, 0.75),
+
+            # Medium backlog and rising demand.
+            (min(q_medium, g_medium), 0.65),
+
+            # Moderate backlog or elevated latency.
+            (max(q_medium, l_medium), 0.50),
+
+            # Low and stable workload.
+            (min(q_low, g_low, l_low), 0.10),
+        ]
+
+
+        total_strength = sum(strength for strength, _ in rules)
+
+        if total_strength == 0:
+            score = 0.40
+        else:
+            score = sum(
+                strength * output_score
+                for strength, output_score in rules
+            ) / total_strength
+
+        score = clamp(score)
+
+        if score >= 0.80:
+            action = "scale_up_aggressively"
+        elif score >= 0.60:
+            action = "scale_up"
+        elif score <= 0.20:
+            action = "consider_scale_down"
+        else:
+            action = "hold"
+
+        return ScalingDecision(
+            score=round(score, 3),
+            action=action,
+            queue_pressure=round(max(q_low * 0, q_medium, q_high), 3),
+            growth_pressure=round(max(g_low * 0, g_medium, g_high), 3),
+            latency_pressure=round(max(l_low * 0, l_medium, l_high), 3),
+        )
+
+
+fuzzy_scaler = FuzzyScaler()
+
+==> ./fastapi-service/app/services/autoscaler.py <==
+
+import asyncio
+import time
+
+from app.config import settings
+from app.services.fuzzy_scaler import fuzzy_scaler
+from app.services.redis_service import redis_service
+from app.services.worker_registry import worker_registry
+
+class AutoscalerService:
+    def __init__(self):
+        self.min_replicas = 1
+        self.max_replicas = 5
+        self.current_replicas = 1
+        self.cooldown_seconds = 15
+        self.last_scaling_action_at = 0.0
+        self.previous_queue_depth = None
+        self.previous_sample_time = None
+        self.recommended_replicas = self.min_replicas
+        self.last_decision = None
+        self.last_sample = None
+        self.low_load_streak = 0
+        self.scale_down_samples_required = 3
+        # Demo defaults; calibrate using measured worker capacity.
+        self.queue_growth_limit = 60.0
+        self._evaluation_lock = asyncio.Lock()
+    async def sync_replica_state(self):
+        workers = await worker_registry.list_workers()
+
+        healthy_count = sum(
+            1 for worker in workers
+            if worker["status"] == "healthy"
+        )
+
+        self.current_replicas = healthy_count
+
+        # Initialize the recommendation from reality on first sync.
+        if self.last_decision is None:
+            self.recommended_replicas = max(
+                self.min_replicas,
+                min(self.max_replicas, healthy_count),
+            )
+
+        return healthy_count
+    async def collect_metrics(self):
+        workers = await worker_registry.list_workers()
+
+        worker_ids = [
+            worker["worker_id"]
+            for worker in workers
+            if worker["status"] == "healthy"
+        ]
+
+        queue_depth = await redis_service.get_queue_depth()
+
+        active_requests = sum(
+            int(worker["active_requests"])
+            for worker in workers
+            if worker["status"] == "healthy"
+        )
+
+        latencies = [
+            float(worker["average_inference_seconds"])
+            for worker in workers
+            if worker["status"] == "healthy"
+            and worker["average_inference_seconds"] is not None
+        ]
+
+        observed_latency = (
+            sum(latencies) / len(latencies) if latencies else 0.5
+        )
+
+        now = time.monotonic()
+
+        if self.previous_queue_depth is None:
+            growth_per_minute = 0.0
+        else:
+            elapsed = max(now - self.previous_sample_time, 0.1)
+            growth_per_minute = (
+                (queue_depth - self.previous_queue_depth)
+                / elapsed
+                * 60
+            )
+
+        self.previous_queue_depth = queue_depth
+        self.previous_sample_time = now
+
+        return {
+            "queue_depth": queue_depth,
+            "queue_growth_per_minute": round(growth_per_minute, 2),
+            "active_requests": active_requests,
+            "healthy_workers": len(worker_ids),
+            "observed_latency_seconds": round(observed_latency, 3),
+        }
+
+    async def evaluate(self):
+        async with self._evaluation_lock:
+            return await self._evaluate_locked()
+
+    async def _evaluate_locked(self):
+        await self.sync_replica_state()
+        metrics = await self.collect_metrics()
+        decision = fuzzy_scaler.evaluate(
+            queue_depth=metrics["queue_depth"],
+            queue_growth_per_minute=metrics["queue_growth_per_minute"],
+            latency_seconds=metrics["observed_latency_seconds"],
+        )
+
+        # Demo policy: translate fuzzy urgency into a replica recommendation.
+        
+        now = time.monotonic()
+        cooldown_active = (
+            now - self.last_scaling_action_at < self.cooldown_seconds
+        )
+
+        # Start from the last persistent recommendation.
+        desired = self.recommended_replicas
+
+        queue_depth = metrics["queue_depth"]
+        active_requests = metrics["active_requests"]
+
+        # Scale down only after sustained idle conditions.
+        safely_idle = (
+            queue_depth == 0
+            and active_requests == 0
+        )
+
+        if safely_idle:
+            self.low_load_streak += 1
+        else:
+            self.low_load_streak = 0
+
+        if not cooldown_active:
+            if decision.action in (
+                "scale_up",
+                "scale_up_aggressively",
+            ):
+                # Increase by one normally; increase by two only
+                # for a severe backlog.
+                increment = (
+                    2
+                    if decision.action == "scale_up_aggressively"
+                    and queue_depth >= 25
+                    else 1
+                )
+                desired += increment
+
+            elif (
+                not cooldown_active
+                and self.low_load_streak >= self.scale_down_samples_required
+                and safely_idle
+            ):
+                desired -= 1
+            desired = max(
+                self.min_replicas,
+                min(self.max_replicas, desired),
+            )
+
+            if desired != self.recommended_replicas:
+                self.recommended_replicas = desired
+                self.last_scaling_action_at = now
+
+                # Reset the idle streak after a scaling recommendation.
+                self.low_load_streak = 0
+
+        self.last_sample = metrics
+        self.last_decision = {
+            "score": decision.score,
+            "action": decision.action,
+            "current_replicas": self.current_replicas,
+            "recommended_replicas": self.recommended_replicas,
+            "mode": "decision_only",
+            "cooldown_active": cooldown_active,
+            "low_load_streak": self.low_load_streak,
+        }
+
+        return {
+            "metrics": metrics,
+            "decision": self.last_decision,
+        }
+
+
+
+    def status(self):
+        return {
+            "mode": "decision_only",
+            "last_sample": self.last_sample,
+            "last_decision": self.last_decision,
+            "replica_limits": {
+                "minimum": self.min_replicas,
+                "maximum": self.max_replicas,
+            },
+        }
+
+
+autoscaler_service = AutoscalerService()
+
+==> ./fastapi-service/app/services/redis_service.py <==
+
+import json
+
+import redis.asyncio as redis
+
+from app.config import settings
+
+
+class RedisService:
+    def __init__(self):
+        self.client = redis.Redis(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            db=settings.REDIS_DB,
+            decode_responses=True,
+        )
+
+    def request_key(self, request_id: str) -> str:
+        return f"request:{request_id}"
+
+    async def ping(self):
+        return await self.client.ping()
+
+    async def enqueue_request(self, request_data: dict):
+        request_id = request_data["request_id"]
+        queue_name = settings.REDIS_QUEUE
+
+        async with self.client.pipeline(transaction=True) as pipeline:
+            pipeline.hset(
+                self.request_key(request_id),
+                mapping={
+                    "request_id": request_id,
+                    "status": "queued",
+                    "prompt": request_data["prompt"],
+                    "max_tokens": request_data["max_tokens"],
+                    "temperature": request_data["temperature"],
+                    "created_at": request_data["created_at"],
+                },
+            )
+            pipeline.lpush(queue_name, json.dumps(request_data))
+            await pipeline.execute()
+
+    async def get_queue_depth(self):
+        return await self.client.llen(settings.REDIS_QUEUE)
+
+    async def get_request(self, request_id: str):
+        data = await self.client.hgetall(self.request_key(request_id))
+        return data or None
+
+    async def update_request(self, request_id: str, fields: dict):
+        clean_fields = {
+            key: str(value)
+            for key, value in fields.items()
+            if value is not None
+        }
+        if clean_fields:
+            await self.client.hset(
+                self.request_key(request_id),
+                mapping=clean_fields,
+            )
+
+    async def close(self):
+        await self.client.aclose()
+
+
+redis_service = RedisService()
+
+==> ./fastapi-service/app/services/worker_registry.py <==
+
+import json
+import time
+
+from app.config import settings
+
+
+WORKER_IDS_KEY = "workers:ids"
+HEARTBEAT_TIMEOUT_SECONDS = 15
+
+
+class WorkerRegistry:
+    def __init__(self):
+        # Reuse the same Redis client as the existing application.
+        from app.services.redis_service import redis_service
+        self.redis = redis_service.client
+
+    @staticmethod
+    def worker_key(worker_id: str) -> str:
+        return f"worker:{worker_id}"
+
+    async def register(self, worker_id: str):
+        now = time.time()
+        key = self.worker_key(worker_id)
+
+        await self.redis.sadd(WORKER_IDS_KEY, worker_id)
+        await self.redis.hset(
+            key,
+            mapping={
+                "worker_id": worker_id,
+                "status": "healthy",
+                "active_requests": 0,
+                "completed_requests": 0,
+                "total_inference_seconds": 0.0,
+                "last_inference_seconds": 0.0,
+                "last_heartbeat": now,
+                "registered_at": now,
+            },
+        )
+
+    async def heartbeat(
+        self,
+        worker_id: str,
+        completed_requests: int,
+        total_inference_seconds: float,
+        last_inference_seconds: float,
+    ):
+        now = time.time()
+        key = self.worker_key(worker_id)
+
+        # Do not silently recreate a worker that was never registered.
+        if not await self.redis.sismember(WORKER_IDS_KEY, worker_id):
+            raise ValueError(f"Worker '{worker_id}' is not registered")
+
+        await self.redis.hset(
+            key,
+            mapping={
+                "status": "healthy",
+                "completed_requests": completed_requests,
+                "total_inference_seconds": total_inference_seconds,
+                "last_inference_seconds": last_inference_seconds,
+                "last_heartbeat": now,
+            },
+        )
+
+    async def start_request(self, worker_id: str):
+        """Atomically record that a registered worker started work."""
+        if not await self.redis.sismember(WORKER_IDS_KEY, worker_id):
+            raise ValueError(f"Worker '{worker_id}' is not registered")
+        await self.redis.hincrby(self.worker_key(worker_id), "active_requests", 1)
+        await self.redis.hset(
+            self.worker_key(worker_id),
+            mapping={"status": "healthy", "last_heartbeat": time.time()},
+        )
+
+    async def finish_request(self, worker_id: str):
+        """Decrement safely, so failures and cancellation cannot go negative."""
+        key = self.worker_key(worker_id)
+        result = await self.redis.eval(
+            "local value = redis.call('HINCRBY', KEYS[1], ARGV[1], -1) "
+            "if value < 0 then redis.call('HSET', KEYS[1], ARGV[1], 0) "
+            "value = 0 end "
+            "redis.call('HSET', KEYS[1], 'last_heartbeat', ARGV[2]) "
+            "return value",
+            1,
+            key,
+            "active_requests",
+            time.time(),
+        )
+        return int(result)
+
+    @staticmethod
+    def processing_queue(worker_id: str) -> str:
+        return f"{settings.REDIS_QUEUE}:processing:{worker_id}"
+
+    async def deregister(self, worker_id: str):
+        """Remove a cleanly stopped worker without touching request data."""
+        processing_queue = self.processing_queue(worker_id)
+        if await self.redis.llen(processing_queue):
+            raise RuntimeError("cannot deregister worker with claimed requests")
+        await self.redis.srem(WORKER_IDS_KEY, worker_id)
+        await self.redis.delete(self.worker_key(worker_id))
+
+    async def recover_claimed_requests(self, worker_id: str):
+        """Return a stale worker's in-flight claims to the shared queue."""
+        processing_queue = self.processing_queue(worker_id)
+        recovered = 0
+        while True:
+            raw_request = await self.redis.rpoplpush(
+                processing_queue, settings.REDIS_QUEUE
+            )
+            if raw_request is None:
+                break
+            try:
+                request_id = json.loads(raw_request)["request_id"]
+                request_key = f"request:{request_id}"
+                status = await self.redis.hget(request_key, "status")
+                if status in {"completed", "failed"}:
+                    await self.redis.lrem(settings.REDIS_QUEUE, 1, raw_request)
+                    continue
+                await self.redis.hset(
+                    request_key,
+                    mapping={"status": "queued", "requeued_at": time.time()},
+                )
+            except (KeyError, TypeError, json.JSONDecodeError):
+                pass
+            recovered += 1
+        return recovered
+
+    async def get_worker(self, worker_id: str):
+        data = await self.redis.hgetall(self.worker_key(worker_id))
+        if not data:
+            return None
+
+        last_heartbeat = float(data["last_heartbeat"])
+        age = max(0.0, time.time() - last_heartbeat)
+
+        completed = int(data["completed_requests"])
+        total_time = float(data["total_inference_seconds"])
+
+        # Completed requests per second over the worker's observed history.
+        registered_at = float(data["registered_at"])
+        elapsed = max(time.time() - registered_at, 1.0)
+        throughput = completed / elapsed
+
+        data.update({
+            "status": (
+                "healthy"
+                if age <= HEARTBEAT_TIMEOUT_SECONDS
+                else "unhealthy"
+            ),
+            "heartbeat_age_seconds": round(age, 3),
+            "throughput_requests_per_second": round(throughput, 4),
+            "average_inference_seconds": (
+                round(total_time / completed, 4)
+                if completed else None
+            ),
+        })
+
+        # Convert numeric fields for a consistent API response.
+        for field in (
+            "active_requests",
+            "completed_requests",
+            "last_heartbeat",
+            "registered_at",
+        ):
+            data[field] = int(float(data[field]))
+
+        for field in (
+            "total_inference_seconds",
+            "last_inference_seconds",
+        ):
+            data[field] = float(data[field])
+
+        return data
+
+
+    async def cleanup_stale_workers(self):
+        """Remove stale registry entries only when their work is drained."""
+        worker_ids = await self.redis.smembers(WORKER_IDS_KEY)
+        removed = []
+
+        for worker_id in worker_ids:
+            key = self.worker_key(worker_id)
+            data = await self.redis.hgetall(key)
+
+            if not data:
+                await self.redis.srem(WORKER_IDS_KEY, worker_id)
+                removed.append(worker_id)
+                continue
+
+            last_heartbeat = float(data.get("last_heartbeat", 0))
+            heartbeat_age = time.time() - last_heartbeat
+
+            if heartbeat_age <= HEARTBEAT_TIMEOUT_SECONDS:
+                continue
+
+            # Recheck the heartbeat before removing the registry entry.
+            latest_heartbeat = await self.redis.hget(
+                key, "last_heartbeat"
+            )
+            if latest_heartbeat != data.get("last_heartbeat"):
+                continue
+
+            recovered = await self.recover_claimed_requests(worker_id)
+            if recovered:
+                print(
+                    f"[Registry] recovered {recovered} request(s) from "
+                    f"stale worker {worker_id}",
+                    flush=True,
+                )
+
+            await self.redis.srem(WORKER_IDS_KEY, worker_id)
+            await self.redis.delete(key)
+            removed.append(worker_id)
+
+        return removed
+
+
+    
+    async def list_workers(self):
+        await self.cleanup_stale_workers()
+
+        worker_ids = sorted(await self.redis.smembers(WORKER_IDS_KEY))
+        workers = []
+
+        for worker_id in worker_ids:
+            worker = await self.get_worker(worker_id)
+            if worker is not None:
+                workers.append(worker)
+
+        return workers
+
+
+
+worker_registry = WorkerRegistry()
+
+==> ./fastapi-service/Dockerfile <==
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+==> ./fastapi-service/tests/test_run_autoscaler.py <==
+import subprocess
+import unittest
+from unittest.mock import patch
+
+import run_autoscaler
+
+
+class AutoscalerControllerTests(unittest.TestCase):
+    def test_running_workers_accepts_compose_json_array(self):
+        result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='[{"State":"running"},{"State":"exited"}]',
+            stderr="",
+        )
+        with patch("run_autoscaler.subprocess.run", return_value=result):
+            self.assertEqual(run_autoscaler.get_running_workers(), 1)
+
+    def test_scale_workers_retries_and_confirms_actual_replicas(self):
+        failed = subprocess.CompletedProcess([], 1, "", "No such container")
+        succeeded = subprocess.CompletedProcess([], 0, "", "")
+        running = subprocess.CompletedProcess(
+            [], 0, '{"State":"running"}\n{"State":"running"}', ""
+        )
+        with (
+            patch(
+                "run_autoscaler.subprocess.run",
+                side_effect=[failed, succeeded, running],
+            ),
+            patch("run_autoscaler.time.sleep"),
+        ):
+            self.assertTrue(run_autoscaler.scale_workers(2))
+
+    def test_scale_down_requires_no_queued_or_active_work(self):
+        self.assertFalse(
+            run_autoscaler.should_scale_down(
+                {"queue_depth": 1, "active_requests": 0}, 1, 2
+            )
+        )
+        self.assertFalse(
+            run_autoscaler.should_scale_down(
+                {"queue_depth": 0, "active_requests": 1}, 1, 2
+            )
+        )
+        self.assertTrue(
+            run_autoscaler.should_scale_down(
+                {"queue_depth": 0, "active_requests": 0}, 1, 2
+            )
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+==> ./fastapi-service/compose.yaml <==
+
+services:
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    env_file:
+      - .env.docker
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker.worker"]
+    env_file:
+      - .env.docker
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+==> ./fastapi-service/run_autoscaler.py <==
+import json
+import os
+import subprocess
+import time
+import urllib.request
+
+API_URL = os.getenv("AUTOSCALER_API_URL", "http://127.0.0.1:8000/autoscaler/evaluate")
+MIN_REPLICAS = 1
+MAX_REPLICAS = 5
+POLL_INTERVAL_SECONDS = float(os.getenv("AUTOSCALER_POLL_SECONDS", "3"))
+SCALE_RETRIES = 3
+
+
+def evaluate_autoscaler():
+    request = urllib.request.Request(
+        API_URL, data=b"", method="POST", headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read().decode())
+
+
+def get_running_workers():
+    result = subprocess.run(
+        ["docker", "compose", "ps", "--format", "json", "worker"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "docker compose ps failed")
+    output = result.stdout.strip()
+    if not output:
+        return 0
+    try:
+        records = json.loads(output)
+        records = records if isinstance(records, list) else [records]
+    except json.JSONDecodeError:
+        records = []
+        for line in output.splitlines():
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return sum(str(item.get("State", "")).lower() == "running" for item in records)
+
+
+def scale_workers(replicas):
+    if not MIN_REPLICAS <= replicas <= MAX_REPLICAS:
+        raise ValueError(f"Replica count out of range: {replicas}")
+    last_error = None
+    for attempt in range(1, SCALE_RETRIES + 1):
+        print(f"Scaling worker replicas to {replicas} (attempt {attempt}/{SCALE_RETRIES})")
+        result = subprocess.run(
+            ["docker", "compose", "up", "-d", "--scale", f"worker={replicas}"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode:
+            last_error = result.stderr.strip() or result.stdout.strip()
+        else:
+            for _ in range(5):
+                if get_running_workers() == replicas:
+                    print(f"Scale confirmed: running workers={replicas}")
+                    return True
+                time.sleep(1)
+            last_error = "Compose completed but replica count did not converge"
+        print(f"Scale attempt failed: {last_error}")
+        time.sleep(attempt)
+    print(f"Scale to {replicas} not confirmed; will retry next poll: {last_error}")
+    return False
+
+
+def should_scale_down(metrics, desired, actual):
+    return desired < actual and metrics["queue_depth"] == 0 and metrics["active_requests"] == 0
+
+
+def main():
+    print(f"Host autoscaling controller started; poll={POLL_INTERVAL_SECONDS}s.")
+    print("Press Ctrl+C to stop the controller.")
+    while True:
+        try:
+            result = evaluate_autoscaler()
+            decision, metrics = result["decision"], result["metrics"]
+            desired = max(MIN_REPLICAS, min(MAX_REPLICAS, int(decision["recommended_replicas"])))
+            actual = get_running_workers()
+            print(
+                f"Queue={metrics['queue_depth']} | Active={metrics['active_requests']} | "
+                f"Healthy={metrics['healthy_workers']} | Running={actual} | "
+                f"Desired={desired} | Action={decision['action']}"
+            )
+            if actual != desired:
+                if desired < actual and not should_scale_down(metrics, desired, actual):
+                    print("Scale-down postponed: queued or active requests remain.")
+                else:
+                    scale_workers(desired)
+        except Exception as exc:
+            print(f"Controller error (will retry): {exc}")
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nAutoscaling controller stopped.")
+
+==> ./fastapi-service/test_fuzzy_scaler.py <==
+
+from app.services.fuzzy_scaler import fuzzy_scaler
+
+scenarios = [
+    {
+        "name": "Idle",
+        "queue_depth": 0,
+        "queue_growth_per_minute": -2,
+        "latency_seconds": 0.5,
+    },
+    {
+        "name": "Moderate load",
+        "queue_depth": 12,
+        "queue_growth_per_minute": 10,
+        "latency_seconds": 3.5,
+    },
+    {
+        "name": "Traffic burst",
+        "queue_depth": 40,
+        "queue_growth_per_minute": 30,
+        "latency_seconds": 7.0,
+    },
+]
+
+for scenario in scenarios:
+    name = scenario["name"]
+    inputs = {k: v for k, v in scenario.items() if k != "name"}
+    result = fuzzy_scaler.evaluate(**inputs)
+
+    print(f"\nScenario: {name}")
+    print(f"  Score:  {result.score}")
+    print(f"  Action: {result.action}")

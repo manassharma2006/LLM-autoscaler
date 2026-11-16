@@ -19,7 +19,7 @@ class WorkerRegistry:
     def worker_key(worker_id: str) -> str:
         return f"worker:{worker_id}"
 
-    async def register(self, worker_id: str):
+    async def register(self, worker_id: str, tier: str = "fast", model: str = "unknown"):
         now = time.time()
         key = self.worker_key(worker_id)
 
@@ -28,6 +28,8 @@ class WorkerRegistry:
             key,
             mapping={
                 "worker_id": worker_id,
+                "tier": tier,
+                "model": model,
                 "status": "healthy",
                 "active_requests": 0,
                 "completed_requests": 0,
@@ -104,10 +106,12 @@ class WorkerRegistry:
     async def recover_claimed_requests(self, worker_id: str):
         """Return a stale worker's in-flight claims to the shared queue."""
         processing_queue = self.processing_queue(worker_id)
+        worker_tier = await self.redis.hget(self.worker_key(worker_id), "tier") or "fast"
+        target_queue = f"{settings.REDIS_QUEUE}:{worker_tier}"
         recovered = 0
         while True:
             raw_request = await self.redis.rpoplpush(
-                processing_queue, settings.REDIS_QUEUE
+                processing_queue, target_queue
             )
             if raw_request is None:
                 break
@@ -116,7 +120,7 @@ class WorkerRegistry:
                 request_key = f"request:{request_id}"
                 status = await self.redis.hget(request_key, "status")
                 if status in {"completed", "failed"}:
-                    await self.redis.lrem(settings.REDIS_QUEUE, 1, raw_request)
+                    await self.redis.lrem(target_queue, 1, raw_request)
                     continue
                 await self.redis.hset(
                     request_key,

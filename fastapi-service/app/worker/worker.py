@@ -6,6 +6,7 @@ import socket
 import time
 from datetime import datetime
 
+import httpx
 import redis.asyncio as redis
 
 from app.config import settings
@@ -14,7 +15,9 @@ from app.services.worker_registry import worker_registry
 
 class InferenceWorker:
     def __init__(self):
-        self.worker_id = os.getenv("WORKER_ID") or f"worker-{socket.gethostname()}"
+        self.tier = os.getenv("WORKER_TIER", "fast")
+        self.model_name = os.getenv("OLLAMA_MODEL", settings.OLLAMA_MODEL)
+        self.worker_id = os.getenv("WORKER_ID") or f"worker-{self.tier}-{socket.gethostname()}"
         self.completed_requests = 0
         self.total_inference_seconds = 0.0
         self.last_inference_seconds = 0.0
@@ -27,7 +30,7 @@ class InferenceWorker:
             socket_timeout=10,
             health_check_interval=30,
         )
-        self.queue_name = settings.REDIS_QUEUE
+        self.queue_name = os.getenv("REDIS_QUEUE", f"{settings.REDIS_QUEUE}:{self.tier}")
         self.processing_queue = worker_registry.processing_queue(self.worker_id)
         self.stop_requested = asyncio.Event()
 
@@ -50,13 +53,32 @@ class InferenceWorker:
             except asyncio.TimeoutError:
                 pass
 
-    async def generate(self, prompt: str, max_tokens: int) -> str:
-        """Temporary simulated inference backend for the demo."""
-        await asyncio.sleep(2)
-        return (
-            f"[SIMULATED OUTPUT] Processed prompt: {prompt[:200]} "
-            f"(max_tokens={max_tokens})"
-        )
+    async def generate(self, prompt: str, max_tokens: int, temperature: float = 0.7) -> str:
+        backend = os.getenv("INFERENCE_BACKEND", "ollama").lower()
+        if backend == "groq" and os.getenv("CLOUD_API_KEY"):
+            used = await self.redis.incr("cloud:requests_used")
+            if used > int(os.getenv("CLOUD_MAX_REQUESTS", "500")):
+                raise RuntimeError("Cloud free-tier safety cap reached")
+            model = os.getenv("CLOUD_MODEL", "llama-3.1-8b-instant")
+            headers = {"Authorization": f"Bearer {os.getenv('CLOUD_API_KEY')}", "Content-Type": "application/json"}
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+                resp.raise_for_status()
+                self.model_name = f"cloud:{model}"
+                return resp.json()["choices"][0]["message"]["content"].strip()
+
+        payload = {"model": os.getenv("OLLAMA_MODEL", settings.OLLAMA_MODEL), "prompt": prompt, "stream": False, "options": {"num_predict": max_tokens, "temperature": temperature}}
+        base_url = os.getenv("OLLAMA_BASE_URL", settings.OLLAMA_BASE_URL)
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(f"{base_url}/api/generate", json=payload)
+            resp.raise_for_status()
+            return resp.json().get("response", "").strip()
 
     @staticmethod
     def created_timestamp(value: str) -> float:
@@ -96,7 +118,7 @@ class InferenceWorker:
             print(f"[{self.worker_id}] processing request={request_id}", flush=True)
 
             inference_started = time.time()
-            output = await self.generate(request["prompt"], int(request["max_tokens"]))
+            output = await self.generate(request["prompt"], int(request["max_tokens"]), float(request.get("temperature", 0.7)))
             finished_at = time.time()
             duration = finished_at - inference_started
             self.completed_requests += 1
@@ -106,6 +128,7 @@ class InferenceWorker:
                 request_key,
                 mapping={
                     "status": "completed",
+                    "model": self.model_name,
                     "output": output,
                     "finished_at": finished_at,
                     "inference_seconds": duration,
@@ -138,7 +161,7 @@ class InferenceWorker:
 
     async def run(self):
         print(f"[{self.worker_id}] listening on shared queue {self.queue_name}", flush=True)
-        await worker_registry.register(self.worker_id)
+        await worker_registry.register(self.worker_id, tier=self.tier, model=self.model_name)
         heartbeat_task = asyncio.create_task(self.heartbeat_loop())
 
         try:

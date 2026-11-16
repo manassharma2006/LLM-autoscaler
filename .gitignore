@@ -10,3 +10,13 @@ fastapi-service/**/*.pyc
 
 # macOS
 .DS_Store
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+**/.env
+!**/.env.example

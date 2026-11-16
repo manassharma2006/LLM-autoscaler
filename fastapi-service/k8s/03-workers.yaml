@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-fast
+  namespace: llm-autoscaler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-fast
+      tier: fast
+  template:
+    metadata:
+      labels:
+        app: worker-fast
+        tier: fast
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: worker
+          image: manassharma11/llm-fuzzy-autoscaler:latest
+          imagePullPolicy: Always
+          command: ["python", "-m", "app.worker.worker"]
+          env:
+            - name: WORKER_TIER
+              value: "fast"
+            - name: REDIS_HOST
+              value: "redis"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_QUEUE
+              value: "inference_queue:fast"
+            - name: INFERENCE_BACKEND
+              value: "groq"
+            - name: CLOUD_MODEL
+              value: "openai/gpt-oss-20b"
+            - name: CLOUD_MAX_REQUESTS
+              value: "500"
+            - name: CLOUD_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-cloud-secrets
+                  key: CLOUD_API_KEY
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-heavy
+  namespace: llm-autoscaler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-heavy
+      tier: heavy
+  template:
+    metadata:
+      labels:
+        app: worker-heavy
+        tier: heavy
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: worker
+          image: manassharma11/llm-fuzzy-autoscaler:latest
+          imagePullPolicy: Always
+          command: ["python", "-m", "app.worker.worker"]
+          env:
+            - name: WORKER_TIER
+              value: "heavy"
+            - name: REDIS_HOST
+              value: "redis"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_QUEUE
+              value: "inference_queue:heavy"
+            - name: INFERENCE_BACKEND
+              value: "groq"
+            - name: CLOUD_MODEL
+              value: "openai/gpt-oss-120b"
+            - name: CLOUD_MAX_REQUESTS
+              value: "500"
+            - name: CLOUD_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-cloud-secrets
+                  key: CLOUD_API_KEY

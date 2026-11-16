@@ -1,4 +1,3 @@
-
 services:
   redis:
     image: redis:7
@@ -20,11 +19,30 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  worker:
+  worker-fast:
     build: .
     command: ["python", "-m", "app.worker.worker"]
     env_file:
       - .env.docker
+    environment:
+      WORKER_TIER: fast
+      OLLAMA_MODEL: qwen2.5:0.5b
+      REDIS_QUEUE: inference_queue:fast
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+  worker-heavy:
+    build: .
+    command: ["python", "-m", "app.worker.worker"]
+    env_file:
+      - .env.docker
+    environment:
+      WORKER_TIER: heavy
+      OLLAMA_MODEL: llama3.2:1b
+      REDIS_QUEUE: inference_queue:heavy
     depends_on:
       redis:
         condition: service_healthy
