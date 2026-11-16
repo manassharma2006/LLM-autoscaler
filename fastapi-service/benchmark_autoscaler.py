@@ -12,15 +12,15 @@ POLL_INTERVAL_SECONDS = 0.5
 TIMEOUT_SECONDS = 180.0
 
 FAST_PROMPTS = [
-    ("Define autoscaling in one sentence.", 250),
-    ("What is Redis BRPOPLPUSH used for?", 250),
-    ("List three benefits of containerization.", 250),
-    ("Explain latency vs throughput briefly.", 250),
+    ("Define autoscaling in one sentence.", 140),
+    ("What is Redis BRPOPLPUSH used for?", 140),
+    ("List three benefits of containerization.", 140),
+    ("Explain latency vs throughput briefly.", 140),
 ]
 
 HEAVY_PROMPTS = [
-    ("Compare reactive threshold-based autoscaling with fuzzy-logic predictive autoscaling in distributed LLM inference systems, detailing latency trade-offs and cold-start overhead.", 500),
-    ("Design a fault-tolerant Redis queue architecture for heterogeneous GPU workers, explaining lease recovery, heartbeat monitoring, and backpressure.", 500),
+    ("Compare reactive threshold-based autoscaling with fuzzy-logic predictive autoscaling in distributed LLM inference systems, detailing latency trade-offs and cold-start overhead.", 350),
+    ("Design a fault-tolerant Redis queue architecture for heterogeneous GPU workers, explaining lease recovery, heartbeat monitoring, and backpressure.", 350),
 ]
 
 
