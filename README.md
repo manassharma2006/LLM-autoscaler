@@ -1,3 +1,4 @@
+[![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/manassharma2006/llm-autoscaler?utm_source=readme&utm_medium=badge)
 # Heterogeneous LLM Inference & Fuzzy-Logic Autoscaling Control Plane
 
 A cloud-native, workload-aware LLM inference orchestration platform built with **FastAPI**, **Redis**, **Docker Compose**, and **Kubernetes (`k3s`)** on **Oracle Cloud Infrastructure (OCI)**.
